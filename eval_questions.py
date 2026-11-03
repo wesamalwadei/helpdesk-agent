@@ -72,4 +72,13 @@ def run_eval(agent=run_agent, pause=3):
 
 
 if __name__ == "__main__":
-    sys.exit(0 if run_eval() == len(CASES) else 1)
+    # python eval_questions.py           -> agent without a framework
+    # python eval_questions.py pydantic  -> Pydantic AI agent
+    if "pydantic" in sys.argv[1:]:
+        from helpdesk_agent_pydantic import run_agent as pydantic_agent
+        print("Evaluating: Pydantic AI agent")
+        score = run_eval(agent=pydantic_agent)
+    else:
+        print("Evaluating: agent without a framework")
+        score = run_eval()
+    sys.exit(0 if score == len(CASES) else 1)
