@@ -74,20 +74,23 @@ if question:
     with st.chat_message("assistant"):
         with st.spinner("Searching the IT guides..."):
             try:
+                issues = []
                 if version == TEAM:
                     result = run_team(question, verbose=False, history=history)
-                    answer, used = result["answer"], result["steps"]
+                    answer, used, issues = result["answer"], result["steps"], result["issues"]
                     user_msg["has_password"] = result["triage"].shares_password
                 else:
                     answer, used = AGENTS[version](question, verbose=False)
             except Exception as e:
-                answer, used = f"Error: {e}\n\nTry again in a minute, or change MODEL in .env.", []
+                answer, used, issues = f"Error: {e}\n\nTry again in a minute, or change MODEL in .env.", [], []
         st.markdown(answer)
         if used:
             st.caption(f"Steps: {' -> '.join(used)}  ({version})")
 
     st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "tools": used, "version": version}
+        # "issues" remembers which problems this answer was about, so a later
+        # "can you open a ticket?" is about the right one.
+        {"role": "assistant", "content": answer, "tools": used, "version": version, "issues": issues}
     )
     if "create_ticket" in used:
         st.rerun()  # refresh the ticket list in the sidebar

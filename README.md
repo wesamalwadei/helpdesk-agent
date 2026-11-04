@@ -58,8 +58,11 @@ Safety rules:
 - Guide answers open a ticket only for high-priority cases (for example phishing).
 - Triage splits a message into separate issues ("my VPN and Outlook don't work" gets two
   answers, each with its own source). Up to 3 issues per message.
-- The employee can ask for a ticket at any time ("can you open a ticket?"): triage picks the
-  most recent problem (or all of them for "both"), and the answer says which one it used. A message that contained a password is never
+- The employee can ask for a ticket at any time ("can you open a ticket?"). Triage only says
+  WHICH kind of request it is (latest problem, a named problem, or "both"/"all"); the code then
+  takes the problem from the chat history, where every answer remembers the issues it was about.
+  So the ticket is always about the right problem, the answer says which one it used, and the
+  same problem never gets a second ticket in one chat. A message that contained a password is never
   passed on from the conversation memory.
 
 Semantic search (RAG by meaning): every guide section is turned into a vector with an

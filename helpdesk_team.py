@@ -34,6 +34,10 @@ class Triage(BaseModel):
     shares_password: bool = Field(description="True if the employee wrote a password in the new message")
     wants_ticket: bool = Field(default=False,
                                description="True if the employee asks to open a ticket or to talk to a technician")
+    ticket_for: Literal["latest", "named", "all"] = Field(
+        default="latest",
+        description="For a ticket request: latest = the last problem discussed; named = the employee "
+                    "names the problem in the new message; all = 'both' / 'all of them'")
     issues: list[Issue] = Field(default_factory=list, description="See the instructions")
 
     # The first issue sets the category and priority shown in the steps.
@@ -59,8 +63,8 @@ issues: one entry per DIFFERENT IT problem, each as a short standalone question.
 - The new message names several problems ("my VPN and Outlook don't work"): one entry each.
 - The new message is a follow-up ("that didn't work", "still broken"): one entry for the
   problem being discussed, using the earlier messages.
-- The employee asks for a ticket: the problems the ticket is for. That is the MOST RECENT
-  problem in the conversation, unless the employee names another one or says "both"/"all".
+- The employee asks for a ticket: set wants_ticket and ticket_for. Fill issues only when
+  ticket_for is "named" (the problem the employee names); otherwise leave issues empty.
 Priority per issue:
 - high: a security risk (clicked a phishing link, shared a password) or the employee cannot work at all
 - medium: one tool or device is not working
@@ -152,7 +156,9 @@ class TicketDraft(BaseModel):
 ticket_agent = Agent(
     output_type=TicketDraft,
     model_settings={"max_tokens": 200},
-    instructions="You write IT support tickets for technicians. Be short and specific. Never include a password.",
+    instructions="""You write IT support tickets for technicians. Be short and specific.
+In details, say what the employee reported and what was already suggested in the conversation
+(so the technician doesn't repeat it). Never include a password.""",
 )
 
 
@@ -195,7 +201,7 @@ def open_ticket(issue, triage, context, models, steps, verbose):
     return ticket
 
 
-def resolve_issue(issue, triage, context, models, steps, verbose):
+def resolve_issue(issue, triage, context, models, steps, verbose, history=None):
     """Search the guides once, answer one issue, and open a ticket if a technician is needed."""
     sections, mode = tools.smart_search(issue.question)  # by meaning; keywords if embeddings fail
     run = run_with_retry(resolver_agent,
@@ -223,12 +229,78 @@ def resolve_issue(issue, triage, context, models, steps, verbose):
     else:
         needs_ticket = res.needs_technician or issue.priority == "high"
     ticket = None
-    if needs_ticket:
+    already = existing_ticket(issue.question, history) if needs_ticket else None
+    if already:
+        answer += f"\n\nYou already have ticket **{already}** for this; the IT team will follow up."
+    elif needs_ticket:
         ticket = open_ticket(issue, triage, context, models, steps, verbose)
         answer += (f"\n\nI also opened ticket **{ticket['id']}** "
                    f"(priority: {issue.priority}, category: {issue.category}) "
                    "so an IT technician can follow up.")
     return answer, ticket
+
+
+# ---------- Which problem is a ticket for? ----------
+# The code decides from the chat history, not the model, so the ticket is always about the
+# right problem. Each assistant message in the history keeps the issues it answered:
+#   {"role": "assistant", "content": ..., "issues": [{"question", "category", "priority", "ticket"}]}
+def latest_issues(history):
+    for m in reversed(history or []):
+        if m["role"] == "assistant" and m.get("issues"):
+            return m["issues"]
+    return []
+
+
+def all_issues(history):
+    seen = {}
+    for m in history or []:
+        for i in m.get("issues", []) if m["role"] == "assistant" else []:
+            seen.setdefault(i["question"].lower(), dict(i))
+            if i.get("ticket"):
+                seen[i["question"].lower()]["ticket"] = i["ticket"]
+    return list(seen.values())
+
+
+def existing_ticket(issue_question, history):
+    """The ticket already opened for this problem in this chat, if any."""
+    for i in all_issues(history):
+        if i["question"].lower() == issue_question.lower() and i.get("ticket"):
+            return i["ticket"]
+    return None
+
+
+def ticket_targets(triage, history):
+    if triage.ticket_for == "named" and triage.issues:
+        return [i.model_dump() for i in triage.issues[:MAX_ISSUES]]
+    if triage.ticket_for == "all":
+        return all_issues(history)[:MAX_ISSUES]
+    return latest_issues(history)
+
+
+def handle_ticket_request(question, triage, context, history, models, steps, verbose):
+    targets = ticket_targets(triage, history)
+    if not targets:
+        answer = ("Sure, I can open a ticket. What is the problem? "
+                  "Describe it in a sentence and I'll pass it to the IT team.")
+        return answer, [], []
+    steps[0] = f"triage_agent ({targets[0]['category']}, {targets[0]['priority']})"
+    lines, tickets, issues = [], [], []
+    for target in targets:
+        issue = Issue(question=target["question"], category=target["category"], priority=target["priority"])
+        already = existing_ticket(issue.question, history)
+        if already:
+            lines.append(f"- **{already}** was already opened for: {issue.question}")
+            issues.append({**issue.model_dump(), "ticket": already})
+            continue
+        t = open_ticket(issue, triage, context, models, steps, verbose)
+        tickets.append(t)
+        issues.append({**issue.model_dump(), "ticket": t["id"]})
+        lines.append(f"- **{t['id']}**: {t['summary']} (priority: {t['priority']}, category: {t['category']}), "
+                     f"for: {issue.question}")
+    answer = ("Here is your ticket status:\n\n" + "\n".join(lines)
+              + "\n\nAn IT technician will follow up with you. "
+              "If you meant a different problem, just tell me which one.")
+    return answer, tickets, issues
 
 
 def run_team(question, models=None, verbose=True, history=None):
@@ -251,29 +323,25 @@ def run_team(question, models=None, verbose=True, history=None):
         print(f"  [triage] it={triage.is_it_question} password={triage.shares_password} "
               f"ticket={triage.wants_ticket} issues={[(i.question, i.category, i.priority) for i in issues]}")
 
-    # 2a. The employee asked for a ticket: open one per problem, straight away.
+    # 2a. The employee asked for a ticket: the code picks the problem from the chat history.
     if triage.wants_ticket:
-        tickets = [open_ticket(issue, triage, context, models, steps, verbose) for issue in issues]
-        lines = [f"- **{t['id']}**: {t['summary']} (priority: {t['priority']}, category: {t['category']})"
-                 for t in tickets]
-        answer = ("Done. I opened " + ("this ticket" if len(tickets) == 1 else "these tickets") + ":\n\n"
-                  + "\n".join(lines)
-                  + "\n\nAn IT technician will follow up with you. "
-                  "If you meant a different problem, just tell me which one.")
+        answer, tickets, done = handle_ticket_request(question, triage, context, history, models, steps, verbose)
         return {"answer": answer, "steps": steps, "triage": triage, "tickets": tickets,
-                "ticket": tickets[0] if tickets else None}
+                "ticket": tickets[0] if tickets else None, "issues": done}
 
     if not triage.is_it_question:
         answer = ("I'm the IT helpdesk assistant, so I can only help with IT questions "
                   "(devices, accounts, software, network and security). "
                   "For other topics, please contact the right department.")
-        return {"answer": answer, "steps": steps, "triage": triage, "tickets": [], "ticket": None}
+        return {"answer": answer, "steps": steps, "triage": triage, "tickets": [], "ticket": None,
+                "issues": []}
 
     # 2b. Answer each problem separately.
-    parts, tickets = [], []
+    parts, tickets, done = [], [], []
     for issue in issues:
-        part, ticket = resolve_issue(issue, triage, context, models, steps, verbose)
+        part, ticket = resolve_issue(issue, triage, context, models, steps, verbose, history)
         parts.append(part)
+        done.append({**issue.model_dump(), "ticket": ticket["id"] if ticket else None})
         if ticket:
             tickets.append(ticket)
     if len(parts) == 1:
@@ -285,7 +353,7 @@ def run_team(question, models=None, verbose=True, history=None):
         answer = "Please don't share your password with anyone, including IT.\n\n" + answer
 
     return {"answer": answer, "steps": steps, "triage": triage, "tickets": tickets,
-            "ticket": tickets[0] if tickets else None}
+            "ticket": tickets[0] if tickets else None, "issues": done}
 
 
 def run_agent(question, models=None, verbose=True, history=None):
@@ -307,6 +375,6 @@ if __name__ == "__main__":
                 print(f"Agent: {result['answer']}")
                 chat.append({"role": "user", "content": question,
                              "has_password": result["triage"].shares_password})
-                chat.append({"role": "assistant", "content": result["answer"]})
+                chat.append({"role": "assistant", "content": result["answer"], "issues": result["issues"]})
             except Exception as e:
                 print(f"Error: {e}\nTry again in a minute, or change MODEL in .env.")
