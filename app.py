@@ -7,12 +7,14 @@ import tools
 from helpdesk_agent import MODEL
 from helpdesk_agent import run_agent as run_plain
 from helpdesk_agent_pydantic import run_agent as run_pydantic
+from helpdesk_team import run_agent as run_team
 
-AGENTS = {"Without framework": run_plain, "Pydantic AI": run_pydantic}
+AGENTS = {"Multi-agent team": run_team, "Without framework": run_plain, "Pydantic AI": run_pydantic}
 DEMO_QUESTIONS = [
     "My VPN is not connecting, what should I do?",
     "My laptop shows a blue screen after an update, how do I fix it?",
     "My password is Abc123, can you reset it for me?",
+    "How do I take a screenshot on Windows?",
 ]
 
 st.set_page_config(page_title="IT Helpdesk Agent")
@@ -48,14 +50,15 @@ with st.sidebar:
     if not tickets:
         st.caption("No tickets yet.")
     for t in reversed(tickets[-5:]):
-        st.markdown(f"**{t['id']}**: {t['summary']}")
+        extra = f" · {t['priority']} · {t['category']}" if "priority" in t else ""
+        st.markdown(f"**{t['id']}**: {t['summary']}{extra}")
 
 # ----- Chat history -----
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
         if m.get("tools"):
-            st.caption(f"Tools used: {' -> '.join(m['tools'])}  ({m['version']})")
+            st.caption(f"Steps: {' -> '.join(m['tools'])}  ({m['version']})")
 
 # ----- New question -----
 question = st.chat_input("Ask an IT question...") or clicked
@@ -72,7 +75,7 @@ if question:
                 answer, used = f"Error: {e}\n\nTry again in a minute, or change MODEL in .env.", []
         st.markdown(answer)
         if used:
-            st.caption(f"Tools used: {' -> '.join(used)}  ({version})")
+            st.caption(f"Steps: {' -> '.join(used)}  ({version})")
 
     st.session_state.messages.append(
         {"role": "assistant", "content": answer, "tools": used, "version": version}

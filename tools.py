@@ -1,4 +1,3 @@
-
 """Tools for the IT helpdesk agent: search the IT docs and create support tickets."""
 import json
 import re
@@ -46,7 +45,7 @@ def search_docs(query, top_k=2, min_score=2):
     return results[:top_k]
 
 
-def create_ticket(summary, details, path=TICKETS_PATH):
+def create_ticket(summary, details, path=TICKETS_PATH, category="other", priority="medium"):
     """Save a support ticket to tickets.json and return it."""
     path = Path(path)
     tickets = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
@@ -54,6 +53,8 @@ def create_ticket(summary, details, path=TICKETS_PATH):
         "id": f"IT-{len(tickets) + 1:04d}",
         "summary": summary,
         "details": details,
+        "category": category,
+        "priority": priority,
         "status": "open",
         "created": datetime.now().isoformat(timespec="seconds"),
     }

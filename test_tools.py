@@ -1,9 +1,8 @@
-
 from tools import create_ticket, load_sections, search_docs
 
 
-def test_docs_have_eight_sections():
-    assert len(load_sections()) == 8
+def test_docs_have_25_sections():
+    assert len(load_sections()) == 25
 
 
 def test_vpn_question_finds_vpn_section():
@@ -25,7 +24,7 @@ def test_phishing_question_finds_phishing_section():
 
 
 def test_unknown_question_returns_nothing():
-    assert search_docs("My laptop shows a blue screen after an update") == []
+    assert search_docs("My laptop battery drains very fast") == []
 
 
 def test_create_ticket_saves_and_numbers(tmp_path):
