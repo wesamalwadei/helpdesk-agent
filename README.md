@@ -1,9 +1,10 @@
 # IT Helpdesk Agent
 
-An AI agent that answers employees' IT questions from the IT guides, cites the source,
-and opens a support ticket when it cannot find an answer.
+An AI helpdesk for the IT department. It answers employees' IT questions from the company
+IT guides and cites the source, gives clearly labelled general guidance when the guides
+don't cover a question, and opens a ticket with a priority when a technician is needed.
 
-> Demo project. The IT guides in `it_docs.md` are sample content, not real company procedures.
+> Demo project. The IT guides in `it_docs.md` (25 topics) are sample content, not real company procedures.
 
 ## The problem
 
@@ -11,39 +12,63 @@ Answers to recurring IT questions (VPN, passwords, printers, software requests) 
 across guides that are hard to find. Employees lose time searching, and the IT helpdesk
 answers the same questions every day.
 
-## What the agent does
+## Three versions
 
-1. The employee asks an IT question.
-2. The agent decides to call `search_docs` to search the IT guides.
-3. If it finds the answer, it replies from the guides only and cites the section.
-4. If not, it says it doesn't know and calls `create_ticket` to open a ticket (saved in `tickets.json`).
-5. It never asks for, repeats, or stores a password.
+| | 1. Without framework | 2. Pydantic AI | 3. Multi-agent team |
+|---|---|---|---|
+| File | `helpdesk_agent.py` | `helpdesk_agent_pydantic.py` | `helpdesk_team.py` |
+| Agents | 1 | 1 | 3 (triage, resolver, ticket writer) |
+| Who searches the guides | The model (tool call) | The model (tool call) | The code, once per question |
+| Not in the guides | Opens a ticket | Opens a ticket | Labelled general guidance, plus a ticket if a technician is needed |
+| Ticket fields | Summary, details | Summary, details | Summary, details, **priority, category** |
+| Non-IT questions | — | — | Politely refused |
+| Invented sources | — | — | Rejected by an output validator |
 
-The model decides which tool to call and when. This is what makes it an AI agent rather than a chatbot.
+Versions 1 and 2 show the same agent built by hand and with a framework.
+Version 3 is the most complete one and is the default in the web interface.
 
-## Two versions of the same agent
+## How the multi-agent team works
 
-| | Without framework | Pydantic AI |
-|---|---|---|
-| File | `helpdesk_agent.py` | `helpdesk_agent_pydantic.py` |
-| Tool-calling loop | Written by hand | Run by the framework |
-| Tool descriptions | Written by hand (JSON schema) | Generated from the function and its docstring |
-| Bad tool arguments | Handled by our code | Detected by the framework, model asked to fix them |
-| Lines of code (no blanks/comments) | 110 | 62 |
+```
+Employee question
+   │
+   ▼
+triage_agent ── not IT? ──► polite refusal (1 request)
+   │  category, priority, password shared?
+   ▼
+search_docs (code, once)
+   │
+   ▼
+resolver_agent ──► "guide" answer + source   (must be a real section: checked by an output validator)
+   │           └─► "general" answer, labelled "General guidance (not from the company IT guides)"
+   ▼
+needs a technician? ──► ticket_agent writes the ticket ──► create_ticket (priority + category)
+```
 
-Both versions use the same tools (`tools.py`), the same rules (system prompt) and the same model.
+Safety rules:
+
+- A "guide" answer must name a real section of the guides; an invented source is rejected
+  and the model must fix it (Pydantic AI `output_validator` + `ModelRetry`).
+- General answers never suggest risky steps (registry, disabling antivirus or firewall, BIOS, admin commands).
+- A shared password is never repeated, the employee is always warned not to share it,
+  and the message never reaches the ticket writer.
+- Guide answers open a ticket only for high-priority cases (for example phishing).
+
+Saving requests: the code searches the guides once and passes the results to the resolver,
+and each agent has a `max_tokens` limit. A question costs 1 to 3 model requests.
 
 ## Project files
 
 | File | Purpose |
 |---|---|
-| `it_docs.md` | Sample IT guides (8 topics) |
+| `it_docs.md` | Sample IT guides (25 topics) |
 | `tools.py` | `search_docs` (keyword search) and `create_ticket` |
-| `helpdesk_agent.py` | Agent without a framework |
-| `helpdesk_agent_pydantic.py` | Agent built with Pydantic AI |
-| `app.py` | Streamlit web interface |
-| `eval_questions.py` | Evaluation on 7 fixed questions |
-| `test_tools.py`, `test_pydantic_agent.py` | Tests that need no API key and no credit |
+| `helpdesk_agent.py` | Version 1: agent without a framework |
+| `helpdesk_agent_pydantic.py` | Version 2: agent built with Pydantic AI |
+| `helpdesk_team.py` | Version 3: multi-agent team |
+| `app.py` | Streamlit web interface (all three versions) |
+| `eval_questions.py` | Evaluation on fixed questions |
+| `test_tools.py`, `test_pydantic_agent.py`, `test_team.py` | Tests that need no API key and no credit |
 
 ## Setup
 
@@ -54,48 +79,54 @@ Both versions use the same tools (`tools.py`), the same rules (system prompt) an
 2. Create a `.env` file (it is in `.gitignore` and must never be uploaded):
    ```
    OPENROUTER_API_KEY=your-key
-   MODEL=nvidia/nemotron-3-ultra-550b-a55b:free
+   MODEL=openai/gpt-4o-mini
    PYDANTIC_AI_NO_BANNER=1
    ```
-   The model must support tool calling. Free models (`:free`) on OpenRouter have daily
-   and shared rate limits; `openai/gpt-4o-mini` is a cheap, more stable option.
+   The model must support tool calling. Free models (`:free`) on OpenRouter work too,
+   but they have a daily limit (50 requests without credit) and can be busy (error 429).
 
 ## Run
 
 ```
-python -m pytest -q                    # tests, no credit used
-python helpdesk_agent.py               # chat in the terminal (no framework)
-python helpdesk_agent_pydantic.py      # chat in the terminal (Pydantic AI)
-python eval_questions.py               # evaluate the version without a framework
-python eval_questions.py pydantic      # evaluate the Pydantic AI version
-streamlit run app.py                   # web interface at http://localhost:8501
+python -m pytest -q                       # tests, no credit used
+python helpdesk_team.py                   # chat in the terminal (multi-agent team)
+python eval_questions.py team             # evaluate the team (9 questions)
+python eval_questions.py team quick       # quick evaluation (4 questions)
+python eval_questions.py                  # evaluate version 1
+python eval_questions.py pydantic         # evaluate version 2
+streamlit run app.py                      # web interface at http://localhost:8501
 ```
 
 ## Evaluation
 
-7 fixed questions: 4 answered by the guides, 2 not covered (must open a ticket),
-and 1 where the employee shares a password (must refuse and point to self-service).
+| Version | Model | Questions | Result |
+|---|---|---|---|
+| 1. Without framework | nvidia/nemotron-3-ultra-550b-a55b:free | 7 | 7/7 |
+| 2. Pydantic AI | nvidia/nemotron-3-ultra-550b-a55b:free | 7 | 7/7 |
+| 3. Multi-agent team | openai/gpt-4o-mini | 9 | 9/9 |
 
-| Version | Model | Result |
-|---|---|---|
-| Without framework | nvidia/nemotron-3-ultra-550b-a55b:free | 7/7 |
-| Pydantic AI | nvidia/nemotron-3-ultra-550b-a55b:free | 7/7 |
+The team's 9 questions: 4 answered by the guides, 3 IT questions the guides don't cover
+(must get labelled general guidance), 1 shared password (must refuse and point to
+self-service), and 1 non-IT question (must refuse without searching).
 
-What this result means, and what it does not:
+The evaluation also found real problems that were then fixed: the model once **invented a
+source** that does not exist in the guides (now rejected by the validator), it classified a
+simple how-to question as non-IT (triage instructions fixed), and it searched up to 16 times
+for one question (now the code searches once).
 
-- One run per version, on 7 questions. Model output can change between runs.
-- The checks look for key phrases (for example "30 minutes" and the source name), so a correct
-  answer with different wording could fail, and the reverse is possible.
-- It shows the agent behaves correctly on these questions, not that it is always accurate.
+What these results mean, and what they do not:
+
+- One run per version, on a small set of questions. Model output can change between runs.
+- The checks look for key phrases (for example "30 minutes" and the source name).
+- They show the agents behave correctly on these questions, not that they are always accurate.
 
 ## Limitations
 
-- Keyword search: it finds sections that share words with the question, not meaning.
-  A question worded very differently may miss the right section.
-- 8 sample topics only. Anything else becomes a ticket.
+- Keyword search: it matches words, not meaning.
+- General answers come from the model's own knowledge, so they can be wrong. They are
+  clearly labelled, and harder problems become tickets.
 - Tickets are saved to a local file, not to a real ticketing system.
 - No memory between questions and no user permissions.
-- Free models can be busy (error 429). The agent retries 3 times, then shows a clear error.
 
 ## Next steps
 
@@ -103,5 +134,4 @@ What this result means, and what it does not:
 - Connect `create_ticket` to a real ticketing system (only that function changes),
   starting with a test (sandbox) environment.
 - Search by meaning (embeddings) instead of keywords.
-- Grow into a multi-agent system: one agent classifies the issue, one searches,
-  one follows up on tickets.
+- Conversation memory, so an employee can follow up ("that didn't work, what next?").

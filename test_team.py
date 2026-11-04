@@ -151,3 +151,17 @@ def test_resolver_gets_search_results_in_one_request(tmp_path, monkeypatch):
     run_team("My VPN is not connecting", models=models, verbose=False)
     assert len(prompts) == 1
     assert "## VPN connection" in prompts[0]
+
+
+def test_shared_password_always_gets_a_warning(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
+    models = {
+        "triage": triage("accounts", "high", password=True),
+        "resolver": search_then_output("password", {"answer_type": "guide", "answer": "Use the self-service page.",
+                                                    "source": "Password reset and account lockout",
+                                                    "needs_technician": False}),
+        "ticket": NO_TICKET,
+    }
+    result = run_team("My password is Abc123, reset it", models=models, verbose=False)
+    assert result["answer"].startswith("Please don't share your password")
+    assert "Abc123" not in result["answer"]

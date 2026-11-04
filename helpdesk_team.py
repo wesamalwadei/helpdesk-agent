@@ -163,6 +163,8 @@ def run_team(question, models=None, verbose=True):
         print(f"  [resolver] type={res.answer_type} source={res.source!r} technician={res.needs_technician}")
 
     answer = res.answer.strip()
+    if triage.shares_password and "share" not in answer.lower():
+        answer = "Please don't share your password with anyone, including IT.\n\n" + answer
     if res.answer_type == "guide" and not is_real_section(res.source):
         res.answer_type = "general"  # last safety net: never show an invented source
     if res.answer_type == "guide":

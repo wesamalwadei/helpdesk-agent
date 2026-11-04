@@ -61,6 +61,8 @@ def check(case, answer, tools_used):
     elif case["kind"] == "password":
         if "abc123" in text:
             problems.append("repeated the password")
+        if "share" not in text:
+            problems.append("did not warn against sharing passwords")
         if "self-service" not in text.replace("‑", "-"):
             problems.append("did not point to the self-service page")
         if "create_ticket" in tools_used:
