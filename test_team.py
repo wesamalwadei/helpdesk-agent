@@ -165,3 +165,66 @@ def test_shared_password_always_gets_a_warning(tmp_path, monkeypatch):
     result = run_team("My password is Abc123, reset it", models=models, verbose=False)
     assert result["answer"].startswith("Please don't share your password")
     assert "Abc123" not in result["answer"]
+
+
+def test_follow_up_ticket_request_uses_the_conversation(tmp_path, monkeypatch):
+    """'Can you open a ticket?' after an email question opens a ticket about email, in 2 requests."""
+    monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
+    seen = []
+
+    def ticket_model(messages, info):
+        seen.append(str(messages))
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name,
+                                                 {"summary": "Email not working", "details": "Outlook steps failed"})])
+
+    history = [{"role": "user", "content": "my email not working"},
+               {"role": "assistant", "content": "Check that Outlook shows Connected."}]
+    models = {
+        "triage": output({"is_it_question": True, "category": "email", "priority": "medium",
+                          "shares_password": False, "wants_ticket": True}),
+        "resolver": NO_TICKET,  # must not run
+        "ticket": FunctionModel(ticket_model),
+    }
+    result = run_team("can you open ticket", models=models, verbose=False, history=history)
+    assert result["steps"] == ["triage_agent (email, medium)", "ticket_agent", "create_ticket"]
+    assert "my email not working" in seen[0]
+    assert "IT-0001" in result["answer"]
+
+
+def test_password_in_earlier_message_is_never_passed_on(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
+    seen = []
+
+    def ticket_model(messages, info):
+        seen.append(str(messages))
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name,
+                                                 {"summary": "Account help", "details": "Needs a technician"})])
+
+    history = [{"role": "user", "content": "My password is Abc123", "has_password": True},
+               {"role": "assistant", "content": "Please don't share your password."}]
+    models = {
+        "triage": output({"is_it_question": True, "category": "accounts", "priority": "high",
+                          "shares_password": False, "wants_ticket": True}),
+        "resolver": NO_TICKET,
+        "ticket": FunctionModel(ticket_model),
+    }
+    run_team("open a ticket please", models=models, verbose=False, history=history)
+    assert "Abc123" not in seen[0]
+    assert "Abc123" not in (tmp_path / "tickets.json").read_text(encoding="utf-8")
+
+
+def test_short_follow_up_is_searched_with_the_earlier_question(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
+    queries = []
+    original = tools.search_docs
+    monkeypatch.setattr(tools, "search_docs", lambda q: queries.append(q) or original(q))
+    history = [{"role": "user", "content": "My VPN is not connecting"},
+               {"role": "assistant", "content": "Restart the VPN app."}]
+    models = {
+        "triage": triage(),
+        "resolver": search_then_output("x", {"answer_type": "guide", "answer": "Contact IT.",
+                                             "source": "VPN connection", "needs_technician": False}),
+        "ticket": NO_TICKET,
+    }
+    run_team("that didn't work", models=models, verbose=False, history=history)
+    assert "VPN" in queries[0]

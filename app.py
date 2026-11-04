@@ -7,9 +7,10 @@ import tools
 from helpdesk_agent import MODEL
 from helpdesk_agent import run_agent as run_plain
 from helpdesk_agent_pydantic import run_agent as run_pydantic
-from helpdesk_team import run_agent as run_team
+from helpdesk_team import run_team
 
-AGENTS = {"Multi-agent team": run_team, "Without framework": run_plain, "Pydantic AI": run_pydantic}
+TEAM = "Multi-agent team"
+AGENTS = {TEAM: None, "Without framework": run_plain, "Pydantic AI": run_pydantic}
 DEMO_QUESTIONS = [
     "My VPN is not connecting, what should I do?",
     "My laptop shows a blue screen after an update, how do I fix it?",
@@ -63,14 +64,22 @@ for m in st.session_state.messages:
 # ----- New question -----
 question = st.chat_input("Ask an IT question...") or clicked
 if question:
-    st.session_state.messages.append({"role": "user", "content": question})
+    # Earlier messages, so the team understands follow-ups like "can you open a ticket?"
+    history = [m for m in st.session_state.messages if m.get("version", TEAM) == TEAM or m["role"] == "user"]
+    user_msg = {"role": "user", "content": question, "has_password": False}
+    st.session_state.messages.append(user_msg)
     with st.chat_message("user"):
         st.markdown(question)
 
     with st.chat_message("assistant"):
         with st.spinner("Searching the IT guides..."):
             try:
-                answer, used = AGENTS[version](question, verbose=False)
+                if version == TEAM:
+                    result = run_team(question, verbose=False, history=history)
+                    answer, used = result["answer"], result["steps"]
+                    user_msg["has_password"] = result["triage"].shares_password
+                else:
+                    answer, used = AGENTS[version](question, verbose=False)
             except Exception as e:
                 answer, used = f"Error: {e}\n\nTry again in a minute, or change MODEL in .env.", []
         st.markdown(answer)

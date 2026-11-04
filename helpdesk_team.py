@@ -26,7 +26,9 @@ class Triage(BaseModel):
     is_it_question: bool = Field(description="True if this is about computers, devices, accounts, software, network or IT security")
     category: Category
     priority: Priority
-    shares_password: bool = Field(description="True if the employee wrote a password in the message")
+    shares_password: bool = Field(description="True if the employee wrote a password in the new message")
+    wants_ticket: bool = Field(default=False,
+                               description="True if the employee asks to open a ticket or to talk to a technician")
 
 
 triage_agent = Agent(
@@ -41,7 +43,9 @@ Priority:
 - high: a security risk (clicked a phishing link, shared a password) or the employee cannot work at all
 - medium: one tool or device is not working
 - low: a how-to question or a request
-category "security" is for phishing, suspicious emails and shared passwords.""",
+category "security" is for phishing, suspicious emails and shared passwords.
+If the new message refers to earlier messages (for example "can you open a ticket" or
+"that didn't work"), classify the IT issue being discussed; that is an IT question.""",
 )
 
 
@@ -76,10 +80,34 @@ You get the question and the matching sections of the company IT guides.
 )
 
 
-def resolver_prompt(question, sections, shares_password):
+def resolver_prompt(question, sections, shares_password, context=""):
     found = "\n\n".join(f"## {r['section']}\n{r['text']}" for r in sections) or "(no matching sections)"
     note = "\n\n(Note: the employee shared a password. Do not repeat it.)" if shares_password else ""
-    return f"Question: {question}{note}\n\nIT guide sections:\n{found}"
+    return f"{context}Question: {question}{note}\n\nIT guide sections:\n{found}"
+
+
+# ---------- Conversation memory ----------
+def conversation_context(history, max_messages=6):
+    """The last messages of the chat as text, so agents understand follow-ups.
+
+    history: list of {"role": "user" | "assistant", "content": str, "has_password": bool}.
+    A user message that contained a password is never passed on.
+    """
+    lines = []
+    for m in (history or [])[-max_messages:]:
+        if m["role"] == "user":
+            text = "[message removed: it contained a password]" if m.get("has_password") else m["content"]
+            lines.append(f"Employee: {text}")
+        else:
+            lines.append(f"Assistant: {m['content'][:300]}")
+    return "Earlier in this conversation:\n" + "\n".join(lines) + "\n\n" if lines else ""
+
+
+def last_user_message(history):
+    for m in reversed(history or []):
+        if m["role"] == "user" and not m.get("has_password"):
+            return m["content"]
+    return ""
 
 
 SECTION_TITLES = {title.lower() for title, _ in tools.load_sections()}
@@ -133,19 +161,46 @@ def run_with_retry(agent, prompt, model, retries=3, wait=15):
             time.sleep(wait)
 
 
-def run_team(question, models=None, verbose=True):
-    """Run the agents. Returns a dict with the answer and every step taken."""
+def open_ticket(question, triage, context, models, steps, verbose):
+    # Never send the new message to the ticket writer if it holds a password.
+    new_message = "The employee shared a password; it was removed." if triage.shares_password else question
+    draft = run_with_retry(ticket_agent, f"{context}New message: {new_message}", models["ticket"]).output
+    ticket = tools.create_ticket(draft.summary, draft.details, path=tools.TICKETS_PATH,
+                                 category=triage.category, priority=triage.priority)
+    steps += ["ticket_agent", "create_ticket"]
+    if verbose:
+        print(f"  [ticket] {ticket['id']}: {ticket['summary']}")
+    return ticket
+
+
+def run_team(question, models=None, verbose=True, history=None):
+    """Run the agents. Returns a dict with the answer and every step taken.
+
+    history: earlier chat messages (see conversation_context), so follow-ups work.
+    """
     if models is None:
         shared = make_model()
         models = {"triage": shared, "resolver": shared, "ticket": shared}
     steps = []
 
+    context = conversation_context(history)
+
     # 1. Triage
-    triage = run_with_retry(triage_agent, question, models["triage"]).output
+    triage_input = f"{context}New message: {question}" if context else question
+    triage = run_with_retry(triage_agent, triage_input, models["triage"]).output
     steps.append(f"triage_agent ({triage.category}, {triage.priority})")
     if verbose:
         print(f"  [triage] it={triage.is_it_question} category={triage.category} "
-              f"priority={triage.priority} password={triage.shares_password}")
+              f"priority={triage.priority} password={triage.shares_password} ticket={triage.wants_ticket}")
+
+    # The employee asked for a ticket: open it straight away.
+    if triage.wants_ticket:
+        ticket = open_ticket(question, triage, context, models, steps, verbose)
+        answer = (f"Done. I opened ticket **{ticket['id']}**: {ticket['summary']} "
+                  f"(priority: {triage.priority}, category: {triage.category}). "
+                  "An IT technician will follow up with you.")
+        return {"answer": answer, "steps": steps, "triage": triage, "ticket": ticket}
+
     if not triage.is_it_question:
         answer = ("I'm the IT helpdesk assistant, so I can only help with IT questions "
                   "(devices, accounts, software, network and security). "
@@ -153,8 +208,10 @@ def run_team(question, models=None, verbose=True):
         return {"answer": answer, "steps": steps, "triage": triage, "ticket": None}
 
     # 2. Search once in code, then resolve
-    sections = tools.search_docs(question)
-    run = run_with_retry(resolver_agent, resolver_prompt(question, sections, triage.shares_password),
+    # A short follow-up ("that didn't work") is searched together with the earlier question.
+    query = f"{last_user_message(history)} {question}" if len(question.split()) <= 5 else question
+    sections = tools.search_docs(query.strip())
+    run = run_with_retry(resolver_agent, resolver_prompt(question, sections, triage.shares_password, context),
                          models["resolver"])
     res = run.output
     steps += ["search_docs", "resolver_agent"]
@@ -181,14 +238,7 @@ def run_team(question, models=None, verbose=True):
     else:
         needs_ticket = res.needs_technician or triage.priority == "high"
     if needs_ticket:
-        # Never send the original text to the ticket writer if it holds a password.
-        ticket_input = "The employee shared a password; it was removed." if triage.shares_password else question
-        draft = run_with_retry(ticket_agent, ticket_input, models["ticket"]).output
-        ticket = tools.create_ticket(draft.summary, draft.details, path=tools.TICKETS_PATH,
-                                     category=triage.category, priority=triage.priority)
-        steps += ["ticket_agent", "create_ticket"]
-        if verbose:
-            print(f"  [ticket] {ticket['id']}: {ticket['summary']}")
+        ticket = open_ticket(question, triage, context, models, steps, verbose)
         answer += (f"\n\nI also opened ticket **{ticket['id']}** "
                    f"(priority: {triage.priority}, category: {triage.category}) "
                    "so an IT technician can follow up.")
@@ -196,21 +246,25 @@ def run_team(question, models=None, verbose=True):
     return {"answer": answer, "steps": steps, "triage": triage, "ticket": ticket}
 
 
-def run_agent(question, models=None, verbose=True):
+def run_agent(question, models=None, verbose=True, history=None):
     """Same shape as the other versions: returns (answer, steps)."""
-    result = run_team(question, models=models, verbose=verbose)
+    result = run_team(question, models=models, verbose=verbose, history=history)
     return result["answer"], result["steps"]
 
 
 if __name__ == "__main__":
     print(f"IT Helpdesk - Multi-agent team (model: {MODEL}). Type 'exit' to quit.")
+    chat = []
     while True:
         question = input("\nYou: ").strip()
         if question.lower() in {"exit", "quit"}:
             break
         if question:
             try:
-                answer, _ = run_agent(question)
-                print(f"Agent: {answer}")
+                result = run_team(question, history=chat)
+                print(f"Agent: {result['answer']}")
+                chat.append({"role": "user", "content": question,
+                             "has_password": result["triage"].shares_password})
+                chat.append({"role": "assistant", "content": result["answer"]})
             except Exception as e:
                 print(f"Error: {e}\nTry again in a minute, or change MODEL in .env.")

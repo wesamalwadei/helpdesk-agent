@@ -22,6 +22,7 @@ answers the same questions every day.
 | Not in the guides | Opens a ticket | Opens a ticket | Labelled general guidance, plus a ticket if a technician is needed |
 | Ticket fields | Summary, details | Summary, details | Summary, details, **priority, category** |
 | Non-IT questions | — | — | Politely refused |
+| Follow-ups ("can you open a ticket?") | — | — | Conversation memory (last 6 messages) |
 | Invented sources | — | — | Rejected by an output validator |
 
 Versions 1 and 2 show the same agent built by hand and with a framework.
@@ -53,6 +54,9 @@ Safety rules:
 - A shared password is never repeated, the employee is always warned not to share it,
   and the message never reaches the ticket writer.
 - Guide answers open a ticket only for high-priority cases (for example phishing).
+- The employee can ask for a ticket at any time ("can you open a ticket?"): triage spots it and
+  the ticket is written from the conversation. A message that contained a password is never
+  passed on from the conversation memory.
 
 Saving requests: the code searches the guides once and passes the results to the resolver,
 and each agent has a `max_tokens` limit. A question costs 1 to 3 model requests.
@@ -126,7 +130,7 @@ What these results mean, and what they do not:
 - General answers come from the model's own knowledge, so they can be wrong. They are
   clearly labelled, and harder problems become tickets.
 - Tickets are saved to a local file, not to a real ticketing system.
-- No memory between questions and no user permissions.
+- Memory lasts for one chat only, and there is no sign-in, so tickets don't record who asked.
 
 ## Next steps
 
@@ -134,4 +138,4 @@ What these results mean, and what they do not:
 - Connect `create_ticket` to a real ticketing system (only that function changes),
   starting with a test (sandbox) environment.
 - Search by meaning (embeddings) instead of keywords.
-- Conversation memory, so an employee can follow up ("that didn't work, what next?").
+- Sign-in, so each ticket records the employee and the agent can check permissions.
