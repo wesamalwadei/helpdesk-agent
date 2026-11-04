@@ -3,7 +3,7 @@
 Note: This is sample content for a demo project. It is not a real company procedure.
 
 ## VPN connection
-To work from outside the office, open the VPN app and sign in with your work email. If the VPN does not connect, check your internet connection, restart the VPN app, then restart your laptop. If it still fails, contact IT.
+To work from home or outside the office and reach company systems, open the VPN app and sign in with your work email. If the VPN does not connect, check your internet connection, restart the VPN app, then restart your laptop. If it still fails, contact IT.
 
 ## Password reset and account lockout
 Your account is locked after 5 wrong password attempts. It unlocks automatically after 30 minutes. To reset your password, use the self-service password page. IT will never ask for your password.

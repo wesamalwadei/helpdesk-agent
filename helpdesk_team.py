@@ -1,8 +1,9 @@
 """Multi-agent IT helpdesk built with Pydantic AI.
 
 Three agents, each with one job:
-  1. triage_agent   - classifies the question: IT or not, category, priority, password shared?
-  2. resolver_agent - answers from the IT guides (searched once by the code); if they don't cover it,
+  1. triage_agent   - classifies the message: IT or not, password shared, ticket wanted,
+                      and splits it into separate issues (each with category and priority)
+  2. resolver_agent - answers from the IT guides (searched by meaning, once, by the code); if they don't cover it,
                       gives safe general IT guidance, clearly labelled
   3. ticket_agent   - writes a clear ticket when a technician is needed
 Python code (run_team) passes the work from one agent to the next.
@@ -22,30 +23,50 @@ GENERAL_LABEL = "General guidance (not from the company IT guides):"
 
 
 # ---------- 1. Triage ----------
-class Triage(BaseModel):
-    is_it_question: bool = Field(description="True if this is about computers, devices, accounts, software, network or IT security")
+class Issue(BaseModel):
+    question: str = Field(description="The IT problem rewritten as a short standalone question")
     category: Category
     priority: Priority
+
+
+class Triage(BaseModel):
+    is_it_question: bool = Field(description="True if this is about computers, devices, accounts, software, network or IT security")
     shares_password: bool = Field(description="True if the employee wrote a password in the new message")
     wants_ticket: bool = Field(default=False,
                                description="True if the employee asks to open a ticket or to talk to a technician")
+    issues: list[Issue] = Field(default_factory=list, description="See the instructions")
+
+    # The first issue sets the category and priority shown in the steps.
+    @property
+    def category(self):
+        return self.issues[0].category if self.issues else "other"
+
+    @property
+    def priority(self):
+        return self.issues[0].priority if self.issues else "low"
 
 
 triage_agent = Agent(
     output_type=Triage,
-    model_settings={"max_tokens": 150},
+    model_settings={"max_tokens": 300},
     instructions="""You classify helpdesk messages. Do not answer them.
 is_it_question: true for anything about computers, phones, devices, accounts, passwords,
 email, internet, software and apps (Windows, Office, Teams...), including simple how-to
 questions such as taking a screenshot or using a shortcut. When in doubt, choose true.
 false only for clearly non-technical topics (weather, pay, holidays, food...).
-Priority:
+
+issues: one entry per DIFFERENT IT problem, each as a short standalone question.
+- The new message names several problems ("my VPN and Outlook don't work"): one entry each.
+- The new message is a follow-up ("that didn't work", "still broken"): one entry for the
+  problem being discussed, using the earlier messages.
+- The employee asks for a ticket: the problems the ticket is for. That is the MOST RECENT
+  problem in the conversation, unless the employee names another one or says "both"/"all".
+Priority per issue:
 - high: a security risk (clicked a phishing link, shared a password) or the employee cannot work at all
 - medium: one tool or device is not working
 - low: a how-to question or a request
 category "security" is for phishing, suspicious emails and shared passwords.
-If the new message refers to earlier messages (for example "can you open a ticket" or
-"that didn't work"), classify the IT issue being discussed; that is an IT question.""",
+Never copy a password into an issue.""",
 )
 
 
@@ -103,13 +124,6 @@ def conversation_context(history, max_messages=6):
     return "Earlier in this conversation:\n" + "\n".join(lines) + "\n\n" if lines else ""
 
 
-def last_user_message(history):
-    for m in reversed(history or []):
-        if m["role"] == "user" and not m.get("has_password"):
-            return m["content"]
-    return ""
-
-
 SECTION_TITLES = {title.lower() for title, _ in tools.load_sections()}
 
 
@@ -161,16 +175,60 @@ def run_with_retry(agent, prompt, model, retries=3, wait=15):
             time.sleep(wait)
 
 
-def open_ticket(question, triage, context, models, steps, verbose):
-    # Never send the new message to the ticket writer if it holds a password.
-    new_message = "The employee shared a password; it was removed." if triage.shares_password else question
-    draft = run_with_retry(ticket_agent, f"{context}New message: {new_message}", models["ticket"]).output
+MAX_ISSUES = 3  # each issue costs one more model request
+
+
+def open_ticket(issue, triage, context, models, steps, verbose):
+    """Write and save a ticket for one issue."""
+    # The issue text is written by triage; a password is never passed on (see conversation_context).
+    problem = issue.question
+    if triage.shares_password:  # the issue text might echo the password: don't pass it on
+        problem = (f"An IT {issue.category} problem. The employee's message contained a password, "
+                   "which was removed. Never include a password.")
+    prompt = f"{context}Write a ticket about this problem: {problem}"
+    draft = run_with_retry(ticket_agent, prompt, models["ticket"]).output
     ticket = tools.create_ticket(draft.summary, draft.details, path=tools.TICKETS_PATH,
-                                 category=triage.category, priority=triage.priority)
+                                 category=issue.category, priority=issue.priority)
     steps += ["ticket_agent", "create_ticket"]
     if verbose:
         print(f"  [ticket] {ticket['id']}: {ticket['summary']}")
     return ticket
+
+
+def resolve_issue(issue, triage, context, models, steps, verbose):
+    """Search the guides once, answer one issue, and open a ticket if a technician is needed."""
+    sections, mode = tools.smart_search(issue.question)  # by meaning; keywords if embeddings fail
+    run = run_with_retry(resolver_agent,
+                         resolver_prompt(issue.question, sections, triage.shares_password, context),
+                         models["resolver"])
+    res = run.output
+    steps += ["semantic_search" if mode == "semantic" else "search_docs", "resolver_agent"]
+    if verbose:
+        print(f"  [search:{mode}] {issue.question!r} -> {[(r['section'], r['score']) for r in sections]}")
+        print(f"  [resolver] type={res.answer_type} source={res.source!r} technician={res.needs_technician}")
+
+    answer = res.answer.strip()
+    if res.answer_type == "guide" and not is_real_section(res.source):
+        res.answer_type = "general"  # last safety net: never show an invented source
+    if res.answer_type == "guide":
+        if res.source and res.source.lower() not in answer.lower():
+            answer += f"\n\nSource: {res.source}"
+    elif not answer.lower().startswith(GENERAL_LABEL.lower()):
+        answer = f"{GENERAL_LABEL}\n\n{answer}"
+
+    # Guide answers are official steps, so only high-priority cases (e.g. security) get a ticket.
+    # General answers get one when a technician is needed or it's high priority.
+    if res.answer_type == "guide":
+        needs_ticket = issue.priority == "high" and res.needs_technician
+    else:
+        needs_ticket = res.needs_technician or issue.priority == "high"
+    ticket = None
+    if needs_ticket:
+        ticket = open_ticket(issue, triage, context, models, steps, verbose)
+        answer += (f"\n\nI also opened ticket **{ticket['id']}** "
+                   f"(priority: {issue.priority}, category: {issue.category}) "
+                   "so an IT technician can follow up.")
+    return answer, ticket
 
 
 def run_team(question, models=None, verbose=True, history=None):
@@ -182,68 +240,52 @@ def run_team(question, models=None, verbose=True, history=None):
         shared = make_model()
         models = {"triage": shared, "resolver": shared, "ticket": shared}
     steps = []
-
     context = conversation_context(history)
 
-    # 1. Triage
+    # 1. Triage: is it IT, which problems, which ticket?
     triage_input = f"{context}New message: {question}" if context else question
     triage = run_with_retry(triage_agent, triage_input, models["triage"]).output
+    issues = triage.issues[:MAX_ISSUES] or [Issue(question=question, category="other", priority="medium")]
     steps.append(f"triage_agent ({triage.category}, {triage.priority})")
     if verbose:
-        print(f"  [triage] it={triage.is_it_question} category={triage.category} "
-              f"priority={triage.priority} password={triage.shares_password} ticket={triage.wants_ticket}")
+        print(f"  [triage] it={triage.is_it_question} password={triage.shares_password} "
+              f"ticket={triage.wants_ticket} issues={[(i.question, i.category, i.priority) for i in issues]}")
 
-    # The employee asked for a ticket: open it straight away.
+    # 2a. The employee asked for a ticket: open one per problem, straight away.
     if triage.wants_ticket:
-        ticket = open_ticket(question, triage, context, models, steps, verbose)
-        answer = (f"Done. I opened ticket **{ticket['id']}**: {ticket['summary']} "
-                  f"(priority: {triage.priority}, category: {triage.category}). "
-                  "An IT technician will follow up with you.")
-        return {"answer": answer, "steps": steps, "triage": triage, "ticket": ticket}
+        tickets = [open_ticket(issue, triage, context, models, steps, verbose) for issue in issues]
+        lines = [f"- **{t['id']}**: {t['summary']} (priority: {t['priority']}, category: {t['category']})"
+                 for t in tickets]
+        answer = ("Done. I opened " + ("this ticket" if len(tickets) == 1 else "these tickets") + ":\n\n"
+                  + "\n".join(lines)
+                  + "\n\nAn IT technician will follow up with you. "
+                  "If you meant a different problem, just tell me which one.")
+        return {"answer": answer, "steps": steps, "triage": triage, "tickets": tickets,
+                "ticket": tickets[0] if tickets else None}
 
     if not triage.is_it_question:
         answer = ("I'm the IT helpdesk assistant, so I can only help with IT questions "
                   "(devices, accounts, software, network and security). "
                   "For other topics, please contact the right department.")
-        return {"answer": answer, "steps": steps, "triage": triage, "ticket": None}
+        return {"answer": answer, "steps": steps, "triage": triage, "tickets": [], "ticket": None}
 
-    # 2. Search once in code, then resolve
-    # A short follow-up ("that didn't work") is searched together with the earlier question.
-    query = f"{last_user_message(history)} {question}" if len(question.split()) <= 5 else question
-    sections = tools.search_docs(query.strip())
-    run = run_with_retry(resolver_agent, resolver_prompt(question, sections, triage.shares_password, context),
-                         models["resolver"])
-    res = run.output
-    steps += ["search_docs", "resolver_agent"]
-    if verbose:
-        print(f"  [search] {[r['section'] for r in sections]}")
-        print(f"  [resolver] type={res.answer_type} source={res.source!r} technician={res.needs_technician}")
-
-    answer = res.answer.strip()
+    # 2b. Answer each problem separately.
+    parts, tickets = [], []
+    for issue in issues:
+        part, ticket = resolve_issue(issue, triage, context, models, steps, verbose)
+        parts.append(part)
+        if ticket:
+            tickets.append(ticket)
+    if len(parts) == 1:
+        answer = parts[0]
+    else:
+        answer = "\n\n".join(f"**{n}. {issue.question}**\n\n{part}"
+                               for n, (issue, part) in enumerate(zip(issues, parts), 1))
     if triage.shares_password and "share" not in answer.lower():
         answer = "Please don't share your password with anyone, including IT.\n\n" + answer
-    if res.answer_type == "guide" and not is_real_section(res.source):
-        res.answer_type = "general"  # last safety net: never show an invented source
-    if res.answer_type == "guide":
-        if res.source and res.source.lower() not in answer.lower():
-            answer += f"\n\nSource: {res.source}"
-    elif not answer.lower().startswith(GENERAL_LABEL.lower()):
-        answer = f"{GENERAL_LABEL}\n\n{answer}"
 
-    # 3. Ticket. Guide answers are official steps, so only high-priority cases (e.g. security)
-    #    get a ticket. General answers get one when a technician is needed or it's high priority.
-    ticket = None
-    if res.answer_type == "guide":
-        needs_ticket = triage.priority == "high" and res.needs_technician
-    else:
-        needs_ticket = res.needs_technician or triage.priority == "high"
-    if needs_ticket:
-        ticket = open_ticket(question, triage, context, models, steps, verbose)
-        answer += (f"\n\nI also opened ticket **{ticket['id']}** "
-                   f"(priority: {triage.priority}, category: {triage.category}) "
-                   "so an IT technician can follow up.")
-
-    return {"answer": answer, "steps": steps, "triage": triage, "ticket": ticket}
+    return {"answer": answer, "steps": steps, "triage": triage, "tickets": tickets,
+            "ticket": tickets[0] if tickets else None}
 
 
 def run_agent(question, models=None, verbose=True, history=None):

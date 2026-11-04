@@ -18,11 +18,13 @@ answers the same questions every day.
 |---|---|---|---|
 | File | `helpdesk_agent.py` | `helpdesk_agent_pydantic.py` | `helpdesk_team.py` |
 | Agents | 1 | 1 | 3 (triage, resolver, ticket writer) |
-| Who searches the guides | The model (tool call) | The model (tool call) | The code, once per question |
+| Who searches the guides | The model (tool call) | The model (tool call) | The code, once per issue |
+| How it searches | Keywords | Keywords | **By meaning (embeddings)**, keywords as fallback |
 | Not in the guides | Opens a ticket | Opens a ticket | Labelled general guidance, plus a ticket if a technician is needed |
 | Ticket fields | Summary, details | Summary, details | Summary, details, **priority, category** |
 | Non-IT questions | — | — | Politely refused |
 | Follow-ups ("can you open a ticket?") | — | — | Conversation memory (last 6 messages) |
+| Several problems in one message | — | — | Split into issues, each answered separately |
 | Invented sources | — | — | Rejected by an output validator |
 
 Versions 1 and 2 show the same agent built by hand and with a framework.
@@ -37,7 +39,7 @@ Employee question
 triage_agent ── not IT? ──► polite refusal (1 request)
    │  category, priority, password shared?
    ▼
-search_docs (code, once)
+semantic_search (code, once per issue: by meaning, with embeddings)
    │
    ▼
 resolver_agent ──► "guide" answer + source   (must be a real section: checked by an output validator)
@@ -54,9 +56,19 @@ Safety rules:
 - A shared password is never repeated, the employee is always warned not to share it,
   and the message never reaches the ticket writer.
 - Guide answers open a ticket only for high-priority cases (for example phishing).
-- The employee can ask for a ticket at any time ("can you open a ticket?"): triage spots it and
-  the ticket is written from the conversation. A message that contained a password is never
+- Triage splits a message into separate issues ("my VPN and Outlook don't work" gets two
+  answers, each with its own source). Up to 3 issues per message.
+- The employee can ask for a ticket at any time ("can you open a ticket?"): triage picks the
+  most recent problem (or all of them for "both"), and the answer says which one it used. A message that contained a password is never
   passed on from the conversation memory.
+
+Semantic search (RAG by meaning): every guide section is turned into a vector with an
+embedding model (`openai/text-embedding-3-small` on OpenRouter), once, and saved to
+`embeddings.json`. Each question is turned into a vector too, and the closest sections by
+cosine similarity are given to the resolver. "I can't reach company systems from home"
+finds the VPN guide even though it never says "VPN". If embeddings fail (no key, no
+internet), it falls back to keyword search. `calibrate_search.py` compares both searches
+and suggests the similarity cut-off (`MIN_SIMILARITY` in `.env`, default 0.35).
 
 Saving requests: the code searches the guides once and passes the results to the resolver,
 and each agent has a `max_tokens` limit. A question costs 1 to 3 model requests.
@@ -66,13 +78,14 @@ and each agent has a `max_tokens` limit. A question costs 1 to 3 model requests.
 | File | Purpose |
 |---|---|
 | `it_docs.md` | Sample IT guides (25 topics) |
-| `tools.py` | `search_docs` (keyword search) and `create_ticket` |
+| `tools.py` | `semantic_search` (by meaning), `search_docs` (keywords) and `create_ticket` |
+| `calibrate_search.py` | Compares semantic and keyword search, suggests `MIN_SIMILARITY` |
 | `helpdesk_agent.py` | Version 1: agent without a framework |
 | `helpdesk_agent_pydantic.py` | Version 2: agent built with Pydantic AI |
 | `helpdesk_team.py` | Version 3: multi-agent team |
 | `app.py` | Streamlit web interface (all three versions) |
 | `eval_questions.py` | Evaluation on fixed questions |
-| `test_tools.py`, `test_pydantic_agent.py`, `test_team.py` | Tests that need no API key and no credit |
+| `test_*.py`, `conftest.py` | Tests that need no API key and no credit (fake models and a fake embedder) |
 
 ## Setup
 
@@ -93,6 +106,7 @@ and each agent has a `max_tokens` limit. A question costs 1 to 3 model requests.
 
 ```
 python -m pytest -q                       # tests, no credit used
+python calibrate_search.py                # compare semantic vs keyword search
 python helpdesk_team.py                   # chat in the terminal (multi-agent team)
 python eval_questions.py team             # evaluate the team (9 questions)
 python eval_questions.py team quick       # quick evaluation (4 questions)
@@ -126,7 +140,7 @@ What these results mean, and what they do not:
 
 ## Limitations
 
-- Keyword search: it matches words, not meaning.
+- Versions 1 and 2 still use keyword search (kept for comparison); the team searches by meaning.
 - General answers come from the model's own knowledge, so they can be wrong. They are
   clearly labelled, and harder problems become tickets.
 - Tickets are saved to a local file, not to a real ticketing system.
@@ -137,5 +151,5 @@ What these results mean, and what they do not:
 - Replace the sample guides with real IT procedures.
 - Connect `create_ticket` to a real ticketing system (only that function changes),
   starting with a test (sandbox) environment.
-- Search by meaning (embeddings) instead of keywords.
+- A vector database if the guides grow to thousands of pages (today 25 sections fit in one file).
 - Sign-in, so each ticket records the employee and the agent can check permissions.

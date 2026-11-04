@@ -34,13 +34,14 @@ def check(case, answer, tools_used):
     """Return a list of problems. An empty list means PASS."""
     text = (answer or "").lower()
     problems = []
+    searched = "search_docs" in tools_used or "semantic_search" in tools_used
     if case["kind"] == "out_of_scope":
-        if "search_docs" in tools_used or "create_ticket" in tools_used:
+        if searched or "create_ticket" in tools_used:
             problems.append("searched or opened a ticket for a non-IT question")
         if "it questions" not in text:
             problems.append("did not say it only handles IT questions")
         return problems
-    if "search_docs" not in tools_used:
+    if not searched:
         problems.append("did not search the docs")
     if case["kind"] == "answer":
         for phrase in case["must_include"]:

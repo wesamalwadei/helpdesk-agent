@@ -24,17 +24,28 @@ def search_then_output(query, data):
     return FunctionModel(model)
 
 
-def triage(category="network", priority="medium", password=False, it=True):
-    return output({"is_it_question": it, "category": category, "priority": priority, "shares_password": password})
+def triage(category="network", priority="medium", password=False, it=True, wants_ticket=False,
+           questions=("The question",)):
+    issues = [{"question": q, "category": category, "priority": priority} for q in questions]
+    return output({"is_it_question": it, "shares_password": password,
+                   "wants_ticket": wants_ticket, "issues": issues})
 
 
 NO_TICKET = output({"summary": "should not run", "details": "x"})
 
 
+def recording_ticket_model(seen, summary="Ticket", details="Details"):
+    def model(messages, info):
+        seen.append(str(messages))
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name,
+                                                 {"summary": summary, "details": details})])
+    return FunctionModel(model)
+
+
 def test_guide_answer_cites_source_and_opens_no_ticket(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
     models = {
-        "triage": triage(),
+        "triage": triage(questions=["My VPN is not connecting"]),
         "resolver": search_then_output("VPN", {"answer_type": "guide", "answer": "Restart the VPN app.",
                                                "source": "VPN connection", "needs_technician": False}),
         "ticket": NO_TICKET,
@@ -62,11 +73,11 @@ def test_general_answer_with_technician_also_opens_ticket(tmp_path, monkeypatch)
     monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
     models = {
         "triage": triage("hardware", "high"),
-        "resolver": search_then_output("blue screen", {"answer_type": "general", "answer": "Restart the laptop.",
-                                                       "source": "", "needs_technician": True}),
-        "ticket": output({"summary": "Blue screen after update", "details": "Laptop shows a blue screen."}),
+        "resolver": search_then_output("battery", {"answer_type": "general", "answer": "Lower the brightness.",
+                                                   "source": "", "needs_technician": True}),
+        "ticket": output({"summary": "Battery drains fast", "details": "Laptop battery drains quickly."}),
     }
-    result = run_team("My laptop shows a blue screen", models=models, verbose=False)
+    result = run_team("My laptop battery drains fast", models=models, verbose=False)
     assert result["steps"][-2:] == ["ticket_agent", "create_ticket"]
     saved = json.loads((tmp_path / "tickets.json").read_text(encoding="utf-8"))
     assert saved[0]["priority"] == "high" and saved[0]["category"] == "hardware"
@@ -75,30 +86,11 @@ def test_general_answer_with_technician_also_opens_ticket(tmp_path, monkeypatch)
 
 def test_non_it_question_is_redirected_without_more_calls(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
-    models = {"triage": triage("other", "low", it=False), "resolver": NO_TICKET, "ticket": NO_TICKET}
+    models = {"triage": output({"is_it_question": False, "shares_password": False, "issues": []}),
+              "resolver": NO_TICKET, "ticket": NO_TICKET}
     result = run_team("What is the weather today?", models=models, verbose=False)
     assert result["steps"] == ["triage_agent (other, low)"]
     assert "IT questions" in result["answer"]
-
-
-def test_password_never_reaches_the_ticket(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
-    seen = []
-
-    def ticket_model(messages, info):
-        seen.append(str(messages))
-        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name,
-                                                 {"summary": "Password help", "details": "Reset needed"})])
-
-    models = {
-        "triage": triage("security", "high", password=True),
-        "resolver": search_then_output("password", {"answer_type": "general", "answer": "Use self-service.",
-                                                    "source": "", "needs_technician": True}),
-        "ticket": FunctionModel(ticket_model),
-    }
-    run_team("My password is Abc123, reset it", models=models, verbose=False)
-    assert seen and "Abc123" not in seen[0]
-    assert "Abc123" not in (tmp_path / "tickets.json").read_text(encoding="utf-8")
 
 
 def test_invented_source_is_rejected_and_answer_becomes_general(tmp_path, monkeypatch):
@@ -147,7 +139,8 @@ def test_resolver_gets_search_results_in_one_request(tmp_path, monkeypatch):
             "answer_type": "guide", "answer": "Restart the VPN app.", "source": "VPN connection",
             "needs_technician": False})])
 
-    models = {"triage": triage(), "resolver": FunctionModel(resolver), "ticket": NO_TICKET}
+    models = {"triage": triage(questions=["My VPN is not connecting"]),
+              "resolver": FunctionModel(resolver), "ticket": NO_TICKET}
     run_team("My VPN is not connecting", models=models, verbose=False)
     assert len(prompts) == 1
     assert "## VPN connection" in prompts[0]
@@ -156,7 +149,7 @@ def test_resolver_gets_search_results_in_one_request(tmp_path, monkeypatch):
 def test_shared_password_always_gets_a_warning(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
     models = {
-        "triage": triage("accounts", "high", password=True),
+        "triage": triage("accounts", "high", password=True, questions=["How do I reset my password?"]),
         "resolver": search_then_output("password", {"answer_type": "guide", "answer": "Use the self-service page.",
                                                     "source": "Password reset and account lockout",
                                                     "needs_technician": False}),
@@ -167,64 +160,95 @@ def test_shared_password_always_gets_a_warning(tmp_path, monkeypatch):
     assert "Abc123" not in result["answer"]
 
 
-def test_follow_up_ticket_request_uses_the_conversation(tmp_path, monkeypatch):
-    """'Can you open a ticket?' after an email question opens a ticket about email, in 2 requests."""
+def test_password_never_reaches_the_ticket(tmp_path, monkeypatch):
+    """Even if triage copies the password into the issue, the ticket writer never sees it."""
     monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
     seen = []
+    models = {
+        "triage": triage("security", "high", password=True, questions=["My password is Abc123, reset it"]),
+        "resolver": search_then_output("password", {"answer_type": "general", "answer": "Use self-service.",
+                                                    "source": "", "needs_technician": True}),
+        "ticket": recording_ticket_model(seen, "Password help", "Reset needed"),
+    }
+    run_team("My password is Abc123, reset it", models=models, verbose=False)
+    assert seen and "Abc123" not in seen[0]
+    assert "Abc123" not in (tmp_path / "tickets.json").read_text(encoding="utf-8")
 
-    def ticket_model(messages, info):
-        seen.append(str(messages))
-        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name,
-                                                 {"summary": "Email not working", "details": "Outlook steps failed"})])
 
-    history = [{"role": "user", "content": "my email not working"},
+# ---------- Several issues and follow-ups ----------
+def test_two_problems_in_one_message_get_two_answers(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
+    queries = []
+    original = tools.search_docs
+    monkeypatch.setattr(tools, "search_docs", lambda q: queries.append(q) or original(q))
+    answers = iter([
+        {"answer_type": "guide", "answer": "Restart the VPN app.", "source": "VPN connection",
+         "needs_technician": False},
+        {"answer_type": "guide", "answer": "Check that Outlook shows Connected.",
+         "source": "Outlook not sending or receiving email", "needs_technician": False},
+    ])
+
+    def resolver(messages, info):
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, next(answers))])
+
+    models = {
+        "triage": triage(questions=["Why is my VPN not connecting?", "Why is Outlook not receiving email?"]),
+        "resolver": FunctionModel(resolver),
+        "ticket": NO_TICKET,
+    }
+    result = run_team("my VPN and my Outlook both don't work", models=models, verbose=False)
+    assert queries == ["Why is my VPN not connecting?", "Why is Outlook not receiving email?"]
+    assert result["steps"].count("resolver_agent") == 2
+    assert "**1. Why is my VPN not connecting?**" in result["answer"]
+    assert "**2. Why is Outlook not receiving email?**" in result["answer"]
+    assert "Source: VPN connection" in result["answer"]
+    assert "Source: Outlook not sending or receiving email" in result["answer"]
+
+
+def test_ticket_request_is_about_the_issue_triage_picked(tmp_path, monkeypatch):
+    """After VPN and then email questions, 'can you open ticket' opens a ticket about email."""
+    monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
+    seen = []
+    history = [{"role": "user", "content": "I cannot connect to the VPN"},
+               {"role": "assistant", "content": "Restart the VPN app."},
+               {"role": "user", "content": "my email is not working"},
                {"role": "assistant", "content": "Check that Outlook shows Connected."}]
     models = {
-        "triage": output({"is_it_question": True, "category": "email", "priority": "medium",
-                          "shares_password": False, "wants_ticket": True}),
+        "triage": triage("email", "medium", wants_ticket=True, questions=["Why is my email not working?"]),
         "resolver": NO_TICKET,  # must not run
-        "ticket": FunctionModel(ticket_model),
+        "ticket": recording_ticket_model(seen, "Email not working", "Outlook steps failed"),
     }
     result = run_team("can you open ticket", models=models, verbose=False, history=history)
     assert result["steps"] == ["triage_agent (email, medium)", "ticket_agent", "create_ticket"]
-    assert "my email not working" in seen[0]
-    assert "IT-0001" in result["answer"]
+    assert "Why is my email not working?" in seen[0]
+    saved = json.loads((tmp_path / "tickets.json").read_text(encoding="utf-8"))
+    assert saved[0]["category"] == "email"
+    assert "If you meant a different problem" in result["answer"]
+
+
+def test_ticket_request_for_both_issues_opens_two_tickets(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
+    seen = []
+    models = {
+        "triage": triage(wants_ticket=True, questions=["VPN not connecting", "Email not working"]),
+        "resolver": NO_TICKET,
+        "ticket": recording_ticket_model(seen),
+    }
+    result = run_team("open tickets for both", models=models, verbose=False)
+    assert result["steps"].count("create_ticket") == 2
+    assert "IT-0001" in result["answer"] and "IT-0002" in result["answer"]
 
 
 def test_password_in_earlier_message_is_never_passed_on(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
     seen = []
-
-    def ticket_model(messages, info):
-        seen.append(str(messages))
-        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name,
-                                                 {"summary": "Account help", "details": "Needs a technician"})])
-
     history = [{"role": "user", "content": "My password is Abc123", "has_password": True},
                {"role": "assistant", "content": "Please don't share your password."}]
     models = {
-        "triage": output({"is_it_question": True, "category": "accounts", "priority": "high",
-                          "shares_password": False, "wants_ticket": True}),
+        "triage": triage("accounts", "high", wants_ticket=True, questions=["I need help with my account"]),
         "resolver": NO_TICKET,
-        "ticket": FunctionModel(ticket_model),
+        "ticket": recording_ticket_model(seen, "Account help", "Needs a technician"),
     }
     run_team("open a ticket please", models=models, verbose=False, history=history)
     assert "Abc123" not in seen[0]
     assert "Abc123" not in (tmp_path / "tickets.json").read_text(encoding="utf-8")
-
-
-def test_short_follow_up_is_searched_with_the_earlier_question(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
-    queries = []
-    original = tools.search_docs
-    monkeypatch.setattr(tools, "search_docs", lambda q: queries.append(q) or original(q))
-    history = [{"role": "user", "content": "My VPN is not connecting"},
-               {"role": "assistant", "content": "Restart the VPN app."}]
-    models = {
-        "triage": triage(),
-        "resolver": search_then_output("x", {"answer_type": "guide", "answer": "Contact IT.",
-                                             "source": "VPN connection", "needs_technician": False}),
-        "ticket": NO_TICKET,
-    }
-    run_team("that didn't work", models=models, verbose=False, history=history)
-    assert "VPN" in queries[0]
