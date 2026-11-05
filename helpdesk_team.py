@@ -5,7 +5,7 @@ Three agents, each with one job:
                       and splits it into separate issues (each with category and priority)
   2. resolver_agent - answers from the IT guides (searched by meaning, once, by the code); if they don't cover it,
                       gives safe general IT guidance, clearly labelled
-  3. ticket_agent   - writes a clear ticket when a technician is needed
+  3. ticket_agent   - writes a clear ticket when the employee asks for one
 Python code (run_team) passes the work from one agent to the next.
 """
 import time
@@ -33,7 +33,8 @@ class Triage(BaseModel):
     is_it_question: bool = Field(description="True if this is about computers, devices, accounts, software, network or IT security")
     shares_password: bool = Field(description="True if the employee wrote a password in the new message")
     wants_ticket: bool = Field(default=False,
-                               description="True if the employee asks to open a ticket or to talk to a technician")
+                               description="True ONLY if the employee explicitly asks to open/create/raise a "
+                                           "ticket or to talk to a technician. Describing a problem is NOT a ticket request.")
     ticket_for: Literal["latest", "named", "all"] = Field(
         default="latest",
         description="For a ticket request: latest = the last problem discussed; named = the employee "
@@ -63,8 +64,11 @@ issues: one entry per DIFFERENT IT problem, each as a short standalone question.
 - The new message names several problems ("my VPN and Outlook don't work"): one entry each.
 - The new message is a follow-up ("that didn't work", "still broken"): one entry for the
   problem being discussed, using the earlier messages.
-- The employee asks for a ticket: set wants_ticket and ticket_for. Fill issues only when
-  ticket_for is "named" (the problem the employee names); otherwise leave issues empty.
+- "I have an issue with my email" or "my VPN is broken" is a PROBLEM, not a ticket request:
+  wants_ticket = false, and add the problem to issues so it gets solutions.
+- Only an explicit request ("open a ticket", "raise a ticket", "I want a technician") sets
+  wants_ticket and ticket_for. Then fill issues only when ticket_for is "named" (the problem
+  the employee names); otherwise leave issues empty.
 Priority per issue:
 - high: a security risk (clicked a phishing link, shared a password) or the employee cannot work at all
 - medium: one tool or device is not working
@@ -202,7 +206,7 @@ def open_ticket(issue, triage, context, models, steps, verbose):
 
 
 def resolve_issue(issue, triage, context, models, steps, verbose, history=None):
-    """Search the guides once, answer one issue, and open a ticket if a technician is needed."""
+    """Search the guides once and answer one issue. Tickets are opened only on request."""
     sections, mode = tools.smart_search(issue.question)  # by meaning; keywords if embeddings fail
     run = run_with_retry(resolver_agent,
                          resolver_prompt(issue.question, sections, triage.shares_password, context),
@@ -222,22 +226,17 @@ def resolve_issue(issue, triage, context, models, steps, verbose, history=None):
     elif not answer.lower().startswith(GENERAL_LABEL.lower()):
         answer = f"{GENERAL_LABEL}\n\n{answer}"
 
-    # Guide answers are official steps, so only high-priority cases (e.g. security) get a ticket.
-    # General answers get one when a technician is needed or it's high priority.
-    if res.answer_type == "guide":
-        needs_ticket = issue.priority == "high" and res.needs_technician
-    else:
-        needs_ticket = res.needs_technician or issue.priority == "high"
-    ticket = None
-    already = existing_ticket(issue.question, history) if needs_ticket else None
+    # Solutions first. A ticket is opened only when the employee asks for one;
+    # here we just offer it (more strongly when a technician is probably needed).
+    already = existing_ticket(issue.question, history)
     if already:
         answer += f"\n\nYou already have ticket **{already}** for this; the IT team will follow up."
-    elif needs_ticket:
-        ticket = open_ticket(issue, triage, context, models, steps, verbose)
-        answer += (f"\n\nI also opened ticket **{ticket['id']}** "
-                   f"(priority: {issue.priority}, category: {issue.category}) "
-                   "so an IT technician can follow up.")
-    return answer, ticket
+    elif res.needs_technician or issue.priority == "high":
+        answer += ("\n\nThis may need an IT technician. If the steps don't fix it, "
+                   "say **open a ticket** and I'll create one for you.")
+    else:
+        answer += "\n\nStill not working? Say **open a ticket** and I'll pass it to the IT team."
+    return answer, None
 
 
 # ---------- Which problem is a ticket for? ----------
@@ -324,6 +323,9 @@ def run_team(question, models=None, verbose=True, history=None):
               f"ticket={triage.wants_ticket} issues={[(i.question, i.category, i.priority) for i in issues]}")
 
     # 2a. The employee asked for a ticket: the code picks the problem from the chat history.
+    #     (If there is nothing to ticket yet but the message describes a problem, solve it first.)
+    if triage.wants_ticket and not ticket_targets(triage, history) and triage.issues:
+        triage.wants_ticket = False
     if triage.wants_ticket:
         answer, tickets, done = handle_ticket_request(question, triage, context, history, models, steps, verbose)
         return {"answer": answer, "steps": steps, "triage": triage, "tickets": tickets,

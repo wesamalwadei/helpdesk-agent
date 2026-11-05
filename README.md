@@ -2,7 +2,7 @@
 
 An AI helpdesk for the IT department. It answers employees' IT questions from the company
 IT guides and cites the source, gives clearly labelled general guidance when the guides
-don't cover a question, and opens a ticket with a priority when a technician is needed.
+don't cover a question, and opens a ticket with a priority when the employee asks for one.
 
 > Demo project. The IT guides in `it_docs.md` (25 topics) are sample content, not real company procedures.
 
@@ -20,7 +20,7 @@ answers the same questions every day.
 | Agents | 1 | 1 | 3 (triage, resolver, ticket writer) |
 | Who searches the guides | The model (tool call) | The model (tool call) | The code, once per issue |
 | How it searches | Keywords | Keywords | **By meaning (embeddings)**, keywords as fallback |
-| Not in the guides | Opens a ticket | Opens a ticket | Labelled general guidance, plus a ticket if a technician is needed |
+| Not in the guides | Opens a ticket | Opens a ticket | Labelled general guidance, and offers a ticket |
 | Ticket fields | Summary, details | Summary, details | Summary, details, **priority, category** |
 | Non-IT questions | — | — | Politely refused |
 | Follow-ups ("can you open a ticket?") | — | — | Conversation memory (last 6 messages) |
@@ -45,7 +45,7 @@ semantic_search (code, once per issue: by meaning, with embeddings)
 resolver_agent ──► "guide" answer + source   (must be a real section: checked by an output validator)
    │           └─► "general" answer, labelled "General guidance (not from the company IT guides)"
    ▼
-needs a technician? ──► ticket_agent writes the ticket ──► create_ticket (priority + category)
+employee asks "open a ticket"? ──► ticket_agent writes it ──► create_ticket (priority + category)
 ```
 
 Safety rules:
@@ -55,7 +55,9 @@ Safety rules:
 - General answers never suggest risky steps (registry, disabling antivirus or firewall, BIOS, admin commands).
 - A shared password is never repeated, the employee is always warned not to share it,
   and the message never reaches the ticket writer.
-- Guide answers open a ticket only for high-priority cases (for example phishing).
+- Solutions first: every answer ends by offering a ticket (more strongly when a technician is
+  probably needed), and a ticket is opened only when the employee asks. Describing a problem
+  ("I have an issue with my email") is never treated as a ticket request.
 - Triage splits a message into separate issues ("my VPN and Outlook don't work" gets two
   answers, each with its own source). Up to 3 issues per message.
 - The employee can ask for a ticket at any time ("can you open a ticket?"). Triage only says
@@ -145,7 +147,7 @@ What these results mean, and what they do not:
 
 - Versions 1 and 2 still use keyword search (kept for comparison); the team searches by meaning.
 - General answers come from the model's own knowledge, so they can be wrong. They are
-  clearly labelled, and harder problems become tickets.
+  clearly labelled, and the employee can turn any problem into a ticket.
 - Tickets are saved to a local file, not to a real ticketing system.
 - Memory lasts for one chat only, and there is no sign-in, so tickets don't record who asked.
 

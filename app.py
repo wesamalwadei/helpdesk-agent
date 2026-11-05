@@ -20,7 +20,7 @@ DEMO_QUESTIONS = [
 
 st.set_page_config(page_title="IT Helpdesk Agent")
 st.title("IT Helpdesk Agent")
-st.caption("Answers from the IT guides, cites the source, and opens a ticket when it can't find an answer.")
+st.caption("Gives solutions from the IT guides with the source. Say \"open a ticket\" any time to reach a technician.")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []

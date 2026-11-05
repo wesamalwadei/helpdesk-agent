@@ -80,19 +80,44 @@ def test_general_answer_is_labelled_and_opens_no_ticket(tmp_path, monkeypatch):
     assert "create_ticket" not in result["steps"]
 
 
-def test_general_answer_with_technician_also_opens_ticket(tmp_path, monkeypatch):
+def test_solutions_first_ticket_only_when_asked(tmp_path, monkeypatch):
+    """A problem gets solutions and an offer; the ticket is opened when the employee asks."""
     monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
     models = {
-        "triage": triage("hardware", "high"),
+        "triage": triage("hardware", "high", questions=["Why does my laptop battery drain fast?"]),
         "resolver": search_then_output("battery", {"answer_type": "general", "answer": "Lower the brightness.",
                                                    "source": "", "needs_technician": True}),
-        "ticket": output({"summary": "Battery drains fast", "details": "Laptop battery drains quickly."}),
+        "ticket": NO_TICKET,
     }
-    result = run_team("My laptop battery drains fast", models=models, verbose=False)
-    assert result["steps"][-2:] == ["ticket_agent", "create_ticket"]
+    first = run_team("My laptop battery drains fast", models=models, verbose=False)
+    assert "create_ticket" not in first["steps"]
+    assert "open a ticket" in first["answer"]
+    assert not (tmp_path / "tickets.json").exists()
+
+    history = [{"role": "user", "content": "My laptop battery drains fast"},
+               {"role": "assistant", "content": first["answer"], "issues": first["issues"]}]
+    models = {"triage": ticket_request(), "resolver": NO_TICKET,
+              "ticket": output({"summary": "Battery drains fast", "details": "Brightness tip did not help."})}
+    second = run_team("still bad, open a ticket", models=models, verbose=False, history=history)
     saved = json.loads((tmp_path / "tickets.json").read_text(encoding="utf-8"))
     assert saved[0]["priority"] == "high" and saved[0]["category"] == "hardware"
-    assert "IT-0001" in result["answer"] and GENERAL_LABEL in result["answer"]
+    assert "IT-0001" in second["answer"]
+
+
+def test_describing_a_problem_is_not_a_ticket_request(tmp_path, monkeypatch):
+    """'I have an issue with my email' gets solutions, even if triage wrongly flags a ticket."""
+    monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
+    models = {
+        "triage": triage("email", "medium", wants_ticket=True, questions=["What is wrong with my email?"]),
+        "resolver": search_then_output("email", {"answer_type": "guide",
+                                                 "answer": "Check that Outlook shows Connected.",
+                                                 "source": "Outlook not sending or receiving email",
+                                                 "needs_technician": False}),
+        "ticket": NO_TICKET,
+    }
+    result = run_team("I have issue in my email", models=models, verbose=False)
+    assert "resolver_agent" in result["steps"] and "create_ticket" not in result["steps"]
+    assert "Outlook" in result["answer"]
 
 
 def test_non_it_question_is_redirected_without_more_calls(tmp_path, monkeypatch):
@@ -176,12 +201,12 @@ def test_password_never_reaches_the_ticket(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "TICKETS_PATH", tmp_path / "tickets.json")
     seen = []
     models = {
-        "triage": triage("security", "high", password=True, questions=["My password is Abc123, reset it"]),
-        "resolver": search_then_output("password", {"answer_type": "general", "answer": "Use self-service.",
-                                                    "source": "", "needs_technician": True}),
+        "triage": triage("security", "high", password=True, wants_ticket=True, ticket_for="named",
+                         questions=["My password is Abc123, reset it"]),
+        "resolver": NO_TICKET,
         "ticket": recording_ticket_model(seen, "Password help", "Reset needed"),
     }
-    run_team("My password is Abc123, reset it", models=models, verbose=False)
+    run_team("My password is Abc123, open a ticket to reset it", models=models, verbose=False)
     assert seen and "Abc123" not in seen[0]
     assert "Abc123" not in (tmp_path / "tickets.json").read_text(encoding="utf-8")
 
